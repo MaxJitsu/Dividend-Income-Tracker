@@ -62,14 +62,12 @@ const DB=[{t:"VHYL",n:"Vanguard FTSE All-World High Div Yield",c:"Equity Income"
 const DATA_FEED_CONFIG = {
   enabled: false,
   apiEndpoint: null,
-  refreshInterval: 300000, // 5 minutes
+  refreshInterval: 300000,
   lastSync: null,
-  provider: "static", // "static" | "api" | "websocket"
+  provider: "static",
 };
 
-// Data feed adapter interface — swap this for live data when ready
 const DataFeedAdapter = {
-  // Returns current dividend data for a ticker
   async getDividendData(ticker) {
     const etf = DB.find(e => e.t === ticker);
     if (!etf) return null;
@@ -87,7 +85,6 @@ const DataFeedAdapter = {
     };
   },
 
-  // Returns dividend history for a ticker (simulated for now)
   async getDividendHistory(ticker, years = 5) {
     const etf = DB.find(e => e.t === ticker);
     if (!etf) return [];
@@ -111,7 +108,6 @@ const DataFeedAdapter = {
     return history;
   },
 
-  // Returns ex-dividend dates (simulated)
   async getExDividendDates(ticker) {
     const etf = DB.find(e => e.t === ticker);
     if (!etf) return [];
@@ -136,7 +132,6 @@ const DataFeedAdapter = {
     return dates;
   },
 
-  // Batch fetch for all holdings
   async refreshAll(holdings) {
     const results = {};
     for (const h of holdings) {
@@ -147,7 +142,6 @@ const DataFeedAdapter = {
   },
 };
 
-// Portfolio export/import format — shared between apps
 const PortfolioExchange = {
   VERSION: "1.0",
   APP_ID: "dividend-tracker",
@@ -234,6 +228,13 @@ function fmtPct(value) {
   return `${(value * 100).toFixed(2)}%`;
 }
 
+function getDaysUntil(exDate) {
+  const now = new Date();
+  now.setHours(0, 0, 0, 0);
+  const ex = new Date(exDate + "T00:00:00Z");
+  return Math.ceil((ex - now) / (1000 * 60 * 60 * 24));
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // CORE COMPUTATION
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -302,7 +303,6 @@ function computeDividendAlerts(holdings, previousDividends = {}) {
     const etf = DB.find(e => e.t === h.ticker);
     if (!etf) continue;
 
-    // Dividend growth alerts
     if (etf.dg > 0.08) {
       alerts.push({ type: "raise", severity: "positive", ticker: h.ticker, name: etf.n, message: `Strong dividend growth: ${(etf.dg * 100).toFixed(1)}% p.a.`, icon: "📈" });
     }
@@ -310,17 +310,14 @@ function computeDividendAlerts(holdings, previousDividends = {}) {
       alerts.push({ type: "flat", severity: "warning", ticker: h.ticker, name: etf.n, message: `Flat dividends — no growth expected`, icon: "➡️" });
     }
 
-    // High yield warning
     if (etf.dy > 0.09) {
       alerts.push({ type: "high-yield", severity: "caution", ticker: h.ticker, name: etf.n, message: `Very high yield (${fmtPct(etf.dy)}) — may not be sustainable`, icon: "⚠️" });
     }
 
-    // Cost drag
     if (etf.oc > 0.005) {
       alerts.push({ type: "cost", severity: "info", ticker: h.ticker, name: etf.n, message: `High OCF (${fmtPct(etf.oc)}) eroding income`, icon: "💸" });
     }
 
-    // Concentration check
     const totalValue = enriched.reduce((a, x) => a + (x.totalValue || 0), 0);
     if (totalValue > 0 && (h.totalValue / totalValue) > 0.25) {
       alerts.push({ type: "concentration", severity: "warning", ticker: h.ticker, name: etf.n, message: `Over 25% of portfolio — consider diversifying`, icon: "⚖️" });
@@ -369,6 +366,131 @@ function forecastIncome(holdings, years = 5) {
     });
   }
   return forecast;
+}
+
+function forecastIncomeWithDRIP(holdings, years = 10) {
+  const enriched = holdings.map(computeHoldingIncome);
+  const baseAnnual = enriched.reduce((a, h) => a + h.annualIncome, 0);
+  const weightedGrowth = enriched.reduce((a, h) => {
+    const weight = h.annualIncome / (baseAnnual || 1);
+    return a + weight * (h.dividendGrowth || 0);
+  }, 0);
+
+  const forecast = [];
+  let cumulativeDRIP = 0;
+  const basePortfolioValue = enriched.reduce((a, h) => a + (h.totalValue || 0), 0);
+
+  for (let y = 0; y <= years; y++) {
+    const withoutDRIP = baseAnnual * Math.pow(1 + weightedGrowth, y);
+    const capitalWithDRIP = basePortfolioValue + cumulativeDRIP;
+    const withDRIP = capitalWithDRIP * (baseAnnual / (basePortfolioValue || 1)) * Math.pow(1 + weightedGrowth, y);
+
+    if (y > 0) {
+      const previousIncome = forecast[y - 1].dripIncome || withoutDRIP;
+      cumulativeDRIP += previousIncome;
+    }
+
+    forecast.push({
+      year: new Date().getFullYear() + y,
+      income: Math.round(withoutDRIP),
+      dripIncome: Math.round(withDRIP),
+    });
+  }
+  return forecast;
+}
+
+function computeTaxImpact(holdings, location, accountType, currency) {
+  const enriched = holdings.map(computeHoldingIncome);
+  const totalDividends = enriched.reduce((a, h) => a + h.annualIncome, 0);
+  let taxAmount = 0;
+  let description = "";
+
+  if (location === "UK") {
+    if (accountType === "SIPP" || accountType === "ISA") {
+      taxAmount = 0;
+      description = accountType === "SIPP" ? "Tax-free growth in SIPP" : "Tax-free in ISA";
+    } else if (accountType === "GIA") {
+      const allowance = 1000;
+      const taxable = Math.max(0, totalDividends - allowance);
+      taxAmount = taxable * 0.3375;
+      description = `GIA: £${allowance} allowance, then 33.75% on excess`;
+    }
+  } else {
+    if (accountType === "IRA" || accountType === "401k") {
+      taxAmount = 0;
+      description = accountType === "IRA" ? "Tax-deferred in IRA" : "Tax-deferred in 401k";
+    } else if (accountType === "Taxable") {
+      taxAmount = totalDividends * 0.15;
+      description = "US Taxable: 15% qualified dividend rate";
+    }
+  }
+
+  return {
+    total: Math.round(taxAmount),
+    rate: taxAmount / (totalDividends || 1),
+    description,
+    afterTax: Math.round(totalDividends - taxAmount),
+  };
+}
+
+function getUpcomingExDates(holdings, days = 30) {
+  const exDates = [];
+  const now = new Date();
+
+  for (const h of holdings) {
+    const etf = DB.find(e => e.t === h.ticker);
+    if (!etf) continue;
+
+    const year = now.getFullYear();
+    const months = etf.p === "Monthly" ? [0,1,2,3,4,5,6,7,8,9,10,11] :
+                   etf.p === "Quarterly" ? [2,5,8,11] :
+                   etf.p === "Semi-Annual" ? [5,11] :
+                   etf.p === "Annual" ? [11] : [];
+
+    for (const m of months) {
+      const seed = (h.ticker.charCodeAt(0) + h.ticker.charCodeAt(h.ticker.length - 1)) % 10;
+      const exDay = Math.min(28, Math.max(5, seed + 8));
+      const exDate = new Date(year, m, exDay).toISOString().slice(0, 10);
+      const daysUntil = getDaysUntil(exDate);
+
+      if (daysUntil > 0 && daysUntil <= days) {
+        exDates.push({
+          ticker: h.ticker,
+          name: etf.n,
+          exDate,
+          daysUntil,
+          buyBeforeDate: new Date(year, m, exDay - 1).toISOString().slice(0, 10),
+        });
+      }
+    }
+  }
+
+  return exDates.sort((a, b) => a.daysUntil - b.daysUntil);
+}
+
+function detectLumpyIncome(projection, holdings) {
+  const incomes = projection.map(m => m.total);
+  const avg = incomes.reduce((a, b) => a + b, 0) / incomes.length;
+  const gapMonths = incomes.filter(m => m < avg * 0.5);
+
+  if (gapMonths.length === 0) return { isLumpy: false, gapCount: 0 };
+
+  return { isLumpy: true, gapCount: gapMonths.length, averageIncome: avg };
+}
+
+function getSmoothingETFs(holdings) {
+  const enriched = holdings.map(computeHoldingIncome);
+  const paymentMonthsSet = new Set();
+
+  for (const h of enriched) {
+    const etf = DB.find(e => e.t === h.ticker);
+    if (!etf) continue;
+    const months = getPaymentMonths(etf.p);
+    months.forEach(m => paymentMonthsSet.add(m));
+  }
+
+  const monthlyETFs = DB.filter(e => e.p === "Monthly" && !holdings.find(h => h.ticker === e.t));
+  return monthlyETFs.slice(0, 3);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -446,10 +568,107 @@ const Badge = ({ text, color, bg, isDark }) => {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// DASHBOARD VIEW
+// ONBOARDING WIZARD (FEATURE 1)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function DashboardView({ isDark, holdings, currency }) {
+function OnboardingWizard({ isDark, onComplete }) {
+  const T = isDark ? darkTheme : lightTheme;
+  const C = T.colors;
+  const [step, setStep] = useState(0);
+  const [location, setLocation] = useState("UK");
+  const [incomeTarget, setIncomeTarget] = useState(2000);
+  const [targetYear, setTargetYear] = useState(2030);
+  const [accountType, setAccountType] = useState("SIPP");
+
+  const incomePresets = [500, 1000, 2000, 3000, 5000];
+  const yearPresets = [2028, 2030, 2035, 2040];
+  const accountTypes = location === "UK" ? ["SIPP", "ISA", "GIA"] : ["IRA", "401k", "Taxable"];
+
+  const handleNext = () => {
+    if (step < 3) {
+      setStep(step + 1);
+    } else {
+      onComplete({ location, incomeTarget, targetYear, accountType });
+    }
+  };
+
+  return <div style={{ display: "flex", flexDirection: "column", height: "100dvh", background: C.bg, fontFamily: T.font.family, color: C.text }}>
+    <div style={{ background: C.navy, padding: `${T.spacing.lg}px`, color: C.white, textAlign: "center" }}>
+      <div style={{ fontSize: T.fontSize.xl, fontWeight: "bold", marginBottom: `${T.spacing.sm}px` }}>Welcome to Dividend Tracker</div>
+      <div style={{ fontSize: T.fontSize.sm, color: C.accentLt }}>Let's set up your profile</div>
+    </div>
+
+    <div style={{ flex: 1, padding: `${T.spacing.lg}px`, overflow: "auto", display: "flex", flexDirection: "column", justifyContent: "center", alignItems: "center" }}>
+      {/* Step 0: Location */}
+      {step === 0 && <div style={{ width: "100%", maxWidth: "300px" }}>
+        <div style={{ fontSize: T.fontSize.lg, fontWeight: "bold", color: C.text, marginBottom: `${T.spacing.lg}px`, textAlign: "center" }}>Where are you based?</div>
+        <div style={{ display: "flex", gap: `${T.spacing.md}px`, marginBottom: `${T.spacing.lg}px` }}>
+          <button onClick={() => setLocation("UK")} style={{ flex: 1, padding: `${T.spacing.lg}px`, background: location === "UK" ? C.accent : C.card, color: location === "UK" ? C.white : C.text, border: `2px solid ${location === "UK" ? C.accent : C.border}`, borderRadius: `${T.radii.md}px`, cursor: "pointer", fontSize: T.fontSize.lg }}>🇬🇧 UK</button>
+          <button onClick={() => setLocation("US")} style={{ flex: 1, padding: `${T.spacing.lg}px`, background: location === "US" ? C.accent : C.card, color: location === "US" ? C.white : C.text, border: `2px solid ${location === "US" ? C.accent : C.border}`, borderRadius: `${T.radii.md}px`, cursor: "pointer", fontSize: T.fontSize.lg }}>🇺🇸 USA</button>
+        </div>
+      </div>}
+
+      {/* Step 1: Income Target */}
+      {step === 1 && <div style={{ width: "100%", maxWidth: "300px" }}>
+        <div style={{ fontSize: T.fontSize.lg, fontWeight: "bold", color: C.text, marginBottom: `${T.spacing.md}px`, textAlign: "center" }}>Monthly income target?</div>
+        <NumInput label={`Target (${location === "UK" ? "£" : "$"})`} value={incomeTarget} onChange={setIncomeTarget} step={100} isDark={isDark} icon="💰" />
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: `${T.spacing.sm}px`, marginTop: `${T.spacing.md}px` }}>
+          {incomePresets.map((p, i) => (
+            <button key={i} onClick={() => setIncomeTarget(p)} style={{ padding: `${T.spacing.sm}px`, background: incomeTarget === p ? C.accent : C.card, color: incomeTarget === p ? C.white : C.text, border: `1px solid ${C.border}`, borderRadius: `${T.radii.sm}px`, cursor: "pointer", fontSize: T.fontSize.sm }}>
+              {location === "UK" ? "£" : "$"}{p}
+            </button>
+          ))}
+        </div>
+      </div>}
+
+      {/* Step 2: Target Year */}
+      {step === 2 && <div style={{ width: "100%", maxWidth: "300px" }}>
+        <div style={{ fontSize: T.fontSize.lg, fontWeight: "bold", color: C.text, marginBottom: `${T.spacing.md}px`, textAlign: "center" }}>Target year?</div>
+        <NumInput label="Year" value={targetYear} onChange={setTargetYear} step={1} isDark={isDark} icon="📅" />
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: `${T.spacing.sm}px`, marginTop: `${T.spacing.md}px` }}>
+          {yearPresets.map((p, i) => (
+            <button key={i} onClick={() => setTargetYear(p)} style={{ padding: `${T.spacing.sm}px`, background: targetYear === p ? C.accent : C.card, color: targetYear === p ? C.white : C.text, border: `1px solid ${C.border}`, borderRadius: `${T.radii.sm}px`, cursor: "pointer", fontSize: T.fontSize.sm }}>
+              {p}
+            </button>
+          ))}
+        </div>
+      </div>}
+
+      {/* Step 3: Account Type */}
+      {step === 3 && <div style={{ width: "100%", maxWidth: "300px" }}>
+        <div style={{ fontSize: T.fontSize.lg, fontWeight: "bold", color: C.text, marginBottom: `${T.spacing.md}px`, textAlign: "center" }}>Account type?</div>
+        <Select label="Account" value={accountType} onChange={setAccountType} options={accountTypes.map(at => ({ value: at, label: at }))} isDark={isDark} icon="🏦" />
+        <div style={{ padding: `${T.spacing.md}px`, background: C.accentLt, borderRadius: `${T.radii.md}px`, color: C.accent, fontSize: T.fontSize.xs, marginTop: `${T.spacing.md}px` }}>
+          {location === "UK" && accountType === "SIPP" && "Tax-free growth in a Self-Invested Personal Pension"}
+          {location === "UK" && accountType === "ISA" && "Tax-free growth & dividends in an Individual Savings Account"}
+          {location === "UK" && accountType === "GIA" && "General Investment Account — dividend allowance then taxed"}
+          {location === "US" && accountType === "IRA" && "Tax-deferred growth in an Individual Retirement Account"}
+          {location === "US" && accountType === "401k" && "Tax-deferred growth in a 401(k) retirement plan"}
+          {location === "US" && accountType === "Taxable" && "Taxable brokerage account — dividends taxed annually"}
+        </div>
+      </div>}
+
+      {/* Progress Dots */}
+      <div style={{ display: "flex", gap: `${T.spacing.sm}px`, marginTop: `${T.spacing.lg}px` }}>
+        {[0, 1, 2, 3].map((s, i) => (
+          <div key={i} style={{ width: "10px", height: "10px", borderRadius: "50%", background: s === step ? C.accent : s < step ? C.green : C.border }} />
+        ))}
+      </div>
+    </div>
+
+    {/* Button Bar */}
+    <div style={{ padding: `${T.spacing.lg}px`, display: "flex", gap: `${T.spacing.sm}px`, borderTop: `1px solid ${C.border}` }}>
+      {step > 0 && <button onClick={() => setStep(step - 1)} style={{ flex: 1, padding: `${T.spacing.md}px`, background: C.card, color: C.text, border: `1px solid ${C.border}`, borderRadius: `${T.radii.md}px`, cursor: "pointer", fontWeight: "bold" }}>Back</button>}
+      <button onClick={handleNext} style={{ flex: 1, padding: `${T.spacing.md}px`, background: C.accent, color: C.white, border: "none", borderRadius: `${T.radii.md}px`, cursor: "pointer", fontWeight: "bold" }}>{step === 3 ? "Start" : "Next"}</button>
+    </div>
+  </div>;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DASHBOARD VIEW (with new features)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function DashboardView({ isDark, holdings, currency, incomeTarget, targetYear, accountType, location, dividendLog, dripEnabled }) {
   const T = isDark ? darkTheme : lightTheme;
   const C = T.colors;
   const enriched = useMemo(() => holdings.map(computeHoldingIncome), [holdings]);
@@ -466,6 +685,8 @@ function DashboardView({ isDark, holdings, currency }) {
   const freqData = useMemo(() => computeIncomeByFrequency(holdings), [holdings]);
   const alerts = useMemo(() => computeDividendAlerts(holdings), [holdings]);
   const forecast = useMemo(() => forecastIncome(holdings, 5), [holdings]);
+  const exDates = useMemo(() => getUpcomingExDates(holdings, 30), [holdings]);
+  const taxData = useMemo(() => computeTaxImpact(holdings, location, accountType, currency), [holdings, location, accountType, currency]);
 
   const nextPayment = useMemo(() => {
     const now = new Date();
@@ -473,6 +694,25 @@ function DashboardView({ isDark, holdings, currency }) {
       if (mp.payments.length > 0) return mp;
     }
     return null;
+  }, [monthlyProjection]);
+
+  const lumpyCheck = useMemo(() => detectLumpyIncome(monthlyProjection, holdings), [monthlyProjection, holdings]);
+  const smoothingETFs = useMemo(() => getSmoothingETFs(holdings), [holdings]);
+
+  const incomeGapMonthly = Math.max(0, incomeTarget - totalMonthly);
+  const capitalNeeded = portfolioYield > 0 ? incomeGapMonthly * 12 / portfolioYield : 0;
+  const yearsToTarget = totalMonthly > 0 ? Math.log(incomeTarget / totalMonthly) / Math.log(1 + weightedGrowth) : 999;
+  const goalProgress = Math.min(100, (totalMonthly / incomeTarget) * 100);
+  const goalColor = goalProgress >= 100 ? C.green : goalProgress >= 75 ? C.amber : C.red;
+
+  const actualYTD = useMemo(() => {
+    const currentYear = new Date().getFullYear();
+    return dividendLog.filter(d => new Date(d.date).getFullYear() === currentYear).reduce((a, d) => a + d.amount, 0);
+  }, [dividendLog]);
+
+  const projectedYTD = useMemo(() => {
+    const currentMonth = new Date().getMonth();
+    return monthlyProjection.slice(0, currentMonth + 1).reduce((a, m) => a + m.total, 0);
   }, [monthlyProjection]);
 
   if (holdings.length === 0) {
@@ -492,8 +732,52 @@ function DashboardView({ isDark, holdings, currency }) {
       <KPI label="Portfolio Yield" value={fmtPct(portfolioYield)} icon="📈" isDark={isDark} />
       <KPI label="Div Growth" value={fmtPct(weightedGrowth)} icon="🌱" isDark={isDark} trend={weightedGrowth * 100} />
       <KPI label="Holdings" value={holdings.length} icon="💼" isDark={isDark} />
-      <KPI label="Portfolio Value" value={fmtCurrency(totalValue, currency)} icon="💵" isDark={isDark} />
+      <KPI label="Tax Impact" value={fmtCurrency(taxData.total, currency)} icon="💳" isDark={isDark} sub={`${(taxData.rate * 100).toFixed(1)}%`} />
     </div>
+
+    {/* Ex-Dividend Countdown (FEATURE 8) */}
+    {exDates.length > 0 && <Card isDark={isDark} style={{ background: isDark ? C.accentDk : C.accentLt, border: `1px solid ${C.accent}`, marginBottom: `${T.spacing.lg}px` }}>
+      <div style={{ fontSize: T.fontSize.lg, fontWeight: "bold", color: C.accent, marginBottom: `${T.spacing.md}px` }}>⏰ Ex-Dividend Coming Up</div>
+      {exDates.slice(0, 3).map((ex, i) => {
+        const dayColor = ex.daysUntil <= 3 ? C.red : ex.daysUntil <= 7 ? C.amber : C.green;
+        return <div key={i} style={{ padding: `${T.spacing.sm}px`, background: isDark ? "rgba(255,255,255,0.05)" : "rgba(0,0,0,0.02)", borderRadius: `${T.radii.sm}px`, marginBottom: i < Math.min(3, exDates.length - 1) ? `${T.spacing.sm}px` : 0, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div>
+            <div style={{ fontSize: T.fontSize.base, fontWeight: "bold", color: C.text }}>{ex.ticker}</div>
+            <div style={{ fontSize: T.fontSize.xs, color: C.muted }}>Buy before {ex.buyBeforeDate}</div>
+          </div>
+          <div style={{ fontSize: T.fontSize.base, fontWeight: "bold", color: dayColor }}>
+            {ex.daysUntil}d
+          </div>
+        </div>;
+      })}
+      {exDates.length > 3 && <div style={{ fontSize: T.fontSize.xs, color: C.muted, textAlign: "center", marginTop: `${T.spacing.sm}px` }}>+{exDates.length - 3} more</div>}
+    </Card>}
+
+    {exDates.length === 0 && <Card isDark={isDark} style={{ background: isDark ? C.accentDk : C.accentLt, border: `1px solid ${C.accent}`, marginBottom: `${T.spacing.lg}px` }}>
+      <div style={{ fontSize: T.fontSize.sm, color: C.muted, textAlign: "center" }}>✓ No upcoming ex-dividend dates in the next 30 days</div>
+    </Card>}
+
+    {/* Income Goal Tracker (FEATURE 2) */}
+    <Card isDark={isDark} style={{ marginBottom: `${T.spacing.lg}px` }}>
+      <div style={{ fontSize: T.fontSize.lg, fontWeight: "bold", color: C.text, marginBottom: `${T.spacing.md}px` }}>🎯 Income Goal Tracker</div>
+      <div style={{ marginBottom: `${T.spacing.md}px` }}>
+        <div style={{ display: "flex", justifyContent: "space-between", fontSize: T.fontSize.sm, marginBottom: `${T.spacing.xs}px` }}>
+          <span style={{ color: C.text }}>{fmtCurrency(totalMonthly, currency)} / {fmtCurrency(incomeTarget, currency)}</span>
+          <span style={{ color: C.muted }}>{goalProgress.toFixed(0)}%</span>
+        </div>
+        <div style={{ height: "8px", background: C.bg, borderRadius: "4px", overflow: "hidden" }}>
+          <div style={{ height: "100%", background: goalColor, width: `${goalProgress}%`, transition: `width ${T.transition.medium}` }} />
+        </div>
+      </div>
+      {incomeGapMonthly > 0 && <div style={{ padding: `${T.spacing.sm}px`, background: C.bg, borderRadius: `${T.radii.sm}px`, marginBottom: `${T.spacing.md}px`, fontSize: T.fontSize.sm }}>
+        <div style={{ color: C.text, marginBottom: `${T.spacing.xs}px` }}>Need {fmtCurrency(incomeGapMonthly, currency)} more monthly to hit target</div>
+        {capitalNeeded > 0 && <div style={{ color: C.muted }}>At {fmtPct(portfolioYield)} yield, that's {fmtCurrency(capitalNeeded, currency)} more invested</div>}
+        {!isNaN(yearsToTarget) && yearsToTarget < 100 && <div style={{ color: C.muted }}>At current growth, you'll hit target in {yearsToTarget.toFixed(1)} years ({new Date().getFullYear() + Math.round(yearsToTarget)})</div>}
+      </div>}
+      {incomeGapMonthly <= 0 && <div style={{ padding: `${T.spacing.sm}px`, background: C.greenLt, borderRadius: `${T.radii.sm}px`, color: C.green, fontSize: T.fontSize.sm, fontWeight: "bold" }}>
+        ✓ You've hit your income target! Target year: {targetYear}
+      </div>}
+    </Card>
 
     {/* Next Payment Banner */}
     {nextPayment && <Card isDark={isDark} style={{ background: isDark ? C.accentDk : C.accentLt, border: `1px solid ${C.accent}` }}>
@@ -518,6 +802,18 @@ function DashboardView({ isDark, holdings, currency }) {
       </div>
     </Card>
 
+    {/* Income Smoothness Suggestion (FEATURE 5) */}
+    {lumpyCheck.isLumpy && holdings.length > 0 && smoothingETFs.length > 0 && <Card isDark={isDark} style={{ background: isDark ? "#3a3a1a" : C.amberLt, border: `1px solid ${C.amber}` }}>
+      <div style={{ fontSize: T.fontSize.sm, fontWeight: "bold", color: C.amber, marginBottom: `${T.spacing.md}px` }}>💡 Income Smoothness Suggestion</div>
+      <div style={{ fontSize: T.fontSize.xs, color: C.text, marginBottom: `${T.spacing.md}px` }}>Your income is lumpy with {lumpyCheck.gapCount} months below average. Adding a monthly-paying ETF could smooth this out:</div>
+      {smoothingETFs.map((etf, i) => (
+        <div key={i} style={{ padding: `${T.spacing.sm}px`, background: isDark ? "rgba(255,255,255,0.05)" : "rgba(0,0,0,0.02)", borderRadius: `${T.radii.sm}px`, marginBottom: i < smoothingETFs.length - 1 ? `${T.spacing.sm}px` : 0, fontSize: T.fontSize.xs }}>
+          <div style={{ fontWeight: "bold", color: C.text }}>{etf.t}: {etf.n.substring(0, 30)}</div>
+          <div style={{ color: C.muted }}>{fmtPct(etf.dy)} yield • Monthly • {etf.c}</div>
+        </div>
+      ))}
+    </Card>}
+
     {/* 5-Year Forecast */}
     <Card isDark={isDark}>
       <div style={{ fontSize: T.fontSize.lg, fontWeight: "bold", color: C.text, marginBottom: `${T.spacing.md}px` }}>🔮 5-Year Income Forecast</div>
@@ -534,6 +830,43 @@ function DashboardView({ isDark, holdings, currency }) {
         </ResponsiveContainer>
       </div>
     </Card>
+
+    {/* Actual vs Projected (FEATURE 7) */}
+    {dividendLog.length > 0 && <Card isDark={isDark}>
+      <div style={{ fontSize: T.fontSize.lg, fontWeight: "bold", color: C.text, marginBottom: `${T.spacing.md}px` }}>📊 Actual vs Projected (YTD)</div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: `${T.spacing.sm}px`, marginBottom: `${T.spacing.md}px` }}>
+        <div style={{ padding: `${T.spacing.sm}px`, background: C.bg, borderRadius: `${T.radii.sm}px`, textAlign: "center" }}>
+          <div style={{ fontSize: T.fontSize.xs, color: C.muted, marginBottom: `${T.spacing.xs}px` }}>Actual</div>
+          <div style={{ fontSize: T.fontSize.base, fontWeight: "bold", color: C.green }}>{fmtCurrency(actualYTD, currency)}</div>
+        </div>
+        <div style={{ padding: `${T.spacing.sm}px`, background: C.bg, borderRadius: `${T.radii.sm}px`, textAlign: "center" }}>
+          <div style={{ fontSize: T.fontSize.xs, color: C.muted, marginBottom: `${T.spacing.xs}px` }}>Projected</div>
+          <div style={{ fontSize: T.fontSize.base, fontWeight: "bold", color: C.accent }}>{fmtCurrency(projectedYTD, currency)}</div>
+        </div>
+        <div style={{ padding: `${T.spacing.sm}px`, background: C.bg, borderRadius: `${T.radii.sm}px`, textAlign: "center" }}>
+          <div style={{ fontSize: T.fontSize.xs, color: C.muted, marginBottom: `${T.spacing.xs}px` }}>Variance</div>
+          <div style={{ fontSize: T.fontSize.base, fontWeight: "bold", color: actualYTD >= projectedYTD ? C.green : C.red }}>
+            {fmtCurrency(actualYTD - projectedYTD, currency)}
+          </div>
+        </div>
+      </div>
+      <div style={{ height: "120px" }}>
+        <ResponsiveContainer width="100%" height="100%">
+          <BarChart data={monthlyProjection.map((m, i) => {
+            const actualMonth = dividendLog.filter(d => new Date(d.date).getMonth() === i && new Date(d.date).getFullYear() === new Date().getFullYear()).reduce((a, d) => a + d.amount, 0);
+            return { month: m.month, actual: actualMonth, projected: m.total };
+          })}>
+            <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
+            <XAxis dataKey="month" tick={{ fontSize: 8, fill: C.muted }} />
+            <YAxis tick={{ fontSize: 8, fill: C.muted }} />
+            <Tooltip formatter={(v) => `${currency}${v.toFixed(2)}`} contentStyle={{ background: C.card, border: `1px solid ${C.border}`, fontSize: T.fontSize.xs }} />
+            <Legend wrapperStyle={{ fontSize: T.fontSize.xs }} />
+            <Bar dataKey="actual" fill={C.green} radius={[2, 2, 0, 0]} />
+            <Bar dataKey="projected" fill={C.accent} radius={[2, 2, 0, 0]} />
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+    </Card>}
 
     {/* Income by Category */}
     <Card isDark={isDark}>
@@ -569,10 +902,10 @@ function DashboardView({ isDark, holdings, currency }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// HOLDINGS VIEW
+// HOLDINGS VIEW (with dividend logging)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function HoldingsView({ isDark, holdings, setHoldings, currency, location }) {
+function HoldingsView({ isDark, holdings, setHoldings, currency, location, dividendLog, setDividendLog }) {
   const T = isDark ? darkTheme : lightTheme;
   const C = T.colors;
   const [showAdd, setShowAdd] = useState(false);
@@ -583,6 +916,9 @@ function HoldingsView({ isDark, holdings, setHoldings, currency, location }) {
   const [addShares, setAddShares] = useState(100);
   const [addCostBasis, setAddCostBasis] = useState(10000);
   const [editIdx, setEditIdx] = useState(-1);
+  const [logIdx, setLogIdx] = useState(-1);
+  const [logDate, setLogDate] = useState(new Date().toISOString().slice(0, 10));
+  const [logAmount, setLogAmount] = useState(0);
 
   const enriched = useMemo(() => holdings.map(computeHoldingIncome), [holdings]);
   const totalValue = enriched.reduce((a, h) => a + (h.totalValue || 0), 0);
@@ -629,17 +965,24 @@ function HoldingsView({ isDark, holdings, setHoldings, currency, location }) {
     URL.revokeObjectURL(url);
   };
 
+  const addPayment = (ticker) => {
+    if (logAmount > 0 && logDate) {
+      setDividendLog([...dividendLog, { ticker, date: logDate, amount: logAmount }]);
+      setLogAmount(0);
+      setLogDate(new Date().toISOString().slice(0, 10));
+      setLogIdx(-1);
+    }
+  };
+
   const filteredDB = useMemo(() => DB.filter(e => e.p !== "None"), []);
 
   return <div style={{ padding: `${T.spacing.lg}px`, overflow: "auto", paddingBottom: "100px" }}>
-    {/* Action Bar */}
     <div style={{ display: "flex", gap: `${T.spacing.sm}px`, marginBottom: `${T.spacing.lg}px`, flexWrap: "wrap" }}>
       <button onClick={() => { setShowAdd(!showAdd); setShowImport(false); }} style={{ flex: "1 1 auto", padding: `${T.spacing.md}px`, background: C.accent, color: C.white, border: "none", borderRadius: `${T.radii.md}px`, cursor: "pointer", fontWeight: "bold", fontSize: T.fontSize.base }}>+ Add Holding</button>
       <button onClick={() => { setShowImport(!showImport); setShowAdd(false); }} style={{ flex: "1 1 auto", padding: `${T.spacing.md}px`, background: C.purple, color: C.white, border: "none", borderRadius: `${T.radii.md}px`, cursor: "pointer", fontWeight: "bold", fontSize: T.fontSize.base }}>📥 Import</button>
       {holdings.length > 0 && <button onClick={handleExport} style={{ flex: "1 1 auto", padding: `${T.spacing.md}px`, background: C.green, color: C.white, border: "none", borderRadius: `${T.radii.md}px`, cursor: "pointer", fontWeight: "bold", fontSize: T.fontSize.base }}>📤 Export</button>}
     </div>
 
-    {/* Import Panel */}
     {showImport && <Card isDark={isDark}>
       <div style={{ fontSize: T.fontSize.lg, fontWeight: "bold", color: C.text, marginBottom: `${T.spacing.md}px` }}>📥 Import from ETF Optimiser</div>
       <div style={{ fontSize: T.fontSize.sm, color: C.muted, marginBottom: `${T.spacing.md}px` }}>Paste the JSON export from the ETF Portfolio Optimiser, or any portfolio JSON file.</div>
@@ -648,7 +991,6 @@ function HoldingsView({ isDark, holdings, setHoldings, currency, location }) {
       <button onClick={handleImport} style={{ width: "100%", padding: `${T.spacing.md}px`, background: C.purple, color: C.white, border: "none", borderRadius: `${T.radii.md}px`, cursor: "pointer", fontWeight: "bold", marginTop: `${T.spacing.md}px` }}>Import Portfolio</button>
     </Card>}
 
-    {/* Add Holding Panel */}
     {showAdd && <Card isDark={isDark}>
       <div style={{ fontSize: T.fontSize.lg, fontWeight: "bold", color: C.text, marginBottom: `${T.spacing.md}px` }}>+ Add New Holding</div>
       <Select label="ETF / Stock" value={selectedTicker} onChange={setSelectedTicker} options={filteredDB.map(e => ({ value: e.t, label: `${e.t} — ${e.n.substring(0, 35)} (${fmtPct(e.dy)} yield)` }))} isDark={isDark} icon="📈" />
@@ -667,14 +1009,12 @@ function HoldingsView({ isDark, holdings, setHoldings, currency, location }) {
       <button onClick={addHolding} style={{ width: "100%", padding: `${T.spacing.md}px`, background: C.green, color: C.white, border: "none", borderRadius: `${T.radii.md}px`, cursor: "pointer", fontWeight: "bold" }}>Add to Portfolio</button>
     </Card>}
 
-    {/* Summary Bar */}
     {holdings.length > 0 && <div style={{ display: "flex", gap: `${T.spacing.md}px`, marginBottom: `${T.spacing.lg}px`, flexWrap: "wrap" }}>
       <KPI label="Total Value" value={fmtCurrency(totalValue, currency)} icon="💵" isDark={isDark} />
       <KPI label="Annual Income" value={fmtCurrency(totalIncome, currency)} icon="💸" isDark={isDark} />
       <KPI label="Avg Yield" value={fmtPct(totalValue > 0 ? totalIncome / totalValue : 0)} icon="📊" isDark={isDark} />
     </div>}
 
-    {/* Holdings List */}
     {enriched.length === 0 ? (
       <Card isDark={isDark} style={{ textAlign: "center" }}>
         <div style={{ fontSize: "32px", marginBottom: `${T.spacing.md}px` }}>📋</div>
@@ -683,8 +1023,8 @@ function HoldingsView({ isDark, holdings, setHoldings, currency, location }) {
     ) : (
       <Card isDark={isDark} style={{ padding: 0, overflow: "hidden" }}>
         {enriched.map((h, i) => (
-          <div key={i} onClick={() => setEditIdx(editIdx === i ? -1 : i)} style={{ padding: `${T.spacing.md}px`, borderBottom: i < enriched.length - 1 ? `1px solid ${C.border}` : "none", cursor: "pointer", transition: `background ${T.transition.fast}` }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div key={i} style={{ padding: `${T.spacing.md}px`, borderBottom: i < enriched.length - 1 ? `1px solid ${C.border}` : "none" }}>
+            <div onClick={() => setEditIdx(editIdx === i ? -1 : i)} style={{ cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
               <div>
                 <div style={{ fontSize: T.fontSize.base, fontWeight: "bold", color: C.text }}>{h.ticker}</div>
                 <div style={{ fontSize: T.fontSize.xs, color: C.muted }}>{h.etfName?.substring(0, 35)}</div>
@@ -702,9 +1042,25 @@ function HoldingsView({ isDark, holdings, setHoldings, currency, location }) {
                 <div>Annual: <strong>{fmtCurrency(h.annualIncome, currency)}</strong></div>
                 <div>Yield on Cost: <strong>{fmtPct(h.yieldOnCost)}</strong></div>
                 <div>Growth: <strong>{fmtPct(h.dividendGrowth)}</strong></div>
-                <div>Category: <strong>{h.category}</strong></div>
-                <div>Per Payment: <strong>{fmtCurrency(h.perPayment, currency)}</strong></div>
               </div>
+
+              {/* Log Dividend Payment (FEATURE 7) */}
+              <div style={{ padding: `${T.spacing.sm}px`, background: isDark ? "rgba(255,255,255,0.05)" : "rgba(0,0,0,0.02)", borderRadius: `${T.radii.sm}px`, marginBottom: `${T.spacing.md}px` }}>
+                <div style={{ fontSize: T.fontSize.sm, fontWeight: "bold", color: C.text, marginBottom: `${T.spacing.sm}px` }}>Log Dividend Payment</div>
+                {logIdx === i ? (
+                  <div>
+                    <input type="date" value={logDate} onChange={(e) => setLogDate(e.target.value)} style={{ width: "100%", padding: `${T.spacing.xs}px`, marginBottom: `${T.spacing.xs}px`, border: `1px solid ${C.border}`, borderRadius: `${T.radii.sm}px`, fontSize: T.fontSize.xs, boxSizing: "border-box" }} />
+                    <div style={{ display: "flex", gap: `${T.spacing.xs}px` }}>
+                      <input type="number" placeholder="Amount" value={logAmount} onChange={(e) => setLogAmount(Number(e.target.value))} step={0.01} style={{ flex: 1, padding: `${T.spacing.xs}px`, border: `1px solid ${C.border}`, borderRadius: `${T.radii.sm}px`, fontSize: T.fontSize.xs }} />
+                      <button onClick={() => addPayment(h.ticker)} style={{ padding: `${T.spacing.xs}px ${T.spacing.sm}px`, background: C.green, color: C.white, border: "none", borderRadius: `${T.radii.sm}px`, cursor: "pointer", fontSize: T.fontSize.xs, fontWeight: "bold" }}>Save</button>
+                      <button onClick={() => setLogIdx(-1)} style={{ padding: `${T.spacing.xs}px ${T.spacing.sm}px`, background: C.border, color: C.text, border: "none", borderRadius: `${T.radii.sm}px`, cursor: "pointer", fontSize: T.fontSize.xs }}>Cancel</button>
+                    </div>
+                  </div>
+                ) : (
+                  <button onClick={() => setLogIdx(i)} style={{ width: "100%", padding: `${T.spacing.xs}px`, background: C.accentLt, color: C.accent, border: "none", borderRadius: `${T.radii.sm}px`, cursor: "pointer", fontSize: T.fontSize.xs, fontWeight: "bold" }}>+ Log Payment</button>
+                )}
+              </div>
+
               <button onClick={(e) => { e.stopPropagation(); removeHolding(i); }} style={{ width: "100%", padding: `${T.spacing.sm}px`, background: C.red, color: C.white, border: "none", borderRadius: `${T.radii.sm}px`, cursor: "pointer", fontWeight: "bold", fontSize: T.fontSize.sm }}>Remove Holding</button>
             </div>}
           </div>
@@ -768,7 +1124,6 @@ function CalendarView({ isDark, holdings, currency }) {
   }
 
   return <div style={{ padding: `${T.spacing.lg}px`, overflow: "auto", paddingBottom: "100px" }}>
-    {/* Annual Overview Chart */}
     <Card isDark={isDark}>
       <div style={{ fontSize: T.fontSize.lg, fontWeight: "bold", color: C.text, marginBottom: `${T.spacing.md}px` }}>📅 {now.getFullYear()} Payment Calendar</div>
       <div style={{ height: "160px" }}>
@@ -784,7 +1139,6 @@ function CalendarView({ isDark, holdings, currency }) {
       </div>
     </Card>
 
-    {/* Month Selector */}
     <div style={{ display: "flex", gap: `${T.spacing.xs}px`, marginBottom: `${T.spacing.lg}px`, flexWrap: "wrap" }}>
       {MONTHS.map((m, i) => (
         <button key={i} onClick={() => setSelectedMonth(i)} style={{
@@ -798,7 +1152,6 @@ function CalendarView({ isDark, holdings, currency }) {
       ))}
     </div>
 
-    {/* Month Detail */}
     <Card isDark={isDark}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: `${T.spacing.md}px` }}>
         <div style={{ fontSize: T.fontSize.lg, fontWeight: "bold", color: C.text }}>{sel.monthFull} {sel.year}</div>
@@ -809,7 +1162,6 @@ function CalendarView({ isDark, holdings, currency }) {
         <div style={{ padding: `${T.spacing.lg}px`, textAlign: "center", color: C.muted, fontSize: T.fontSize.base }}>No dividend payments scheduled this month</div>
       ) : (
         <>
-          {/* Ex-Dividend Dates */}
           {sel.exDates.length > 0 && <div style={{ marginBottom: `${T.spacing.md}px` }}>
             <div style={{ fontSize: T.fontSize.sm, fontWeight: "bold", color: C.amber, marginBottom: `${T.spacing.sm}px` }}>⚡ Ex-Dividend Dates</div>
             <div style={{ display: "flex", flexWrap: "wrap", gap: `${T.spacing.xs}px` }}>
@@ -821,7 +1173,6 @@ function CalendarView({ isDark, holdings, currency }) {
             </div>
           </div>}
 
-          {/* Payment Schedule */}
           <div style={{ fontSize: T.fontSize.sm, fontWeight: "bold", color: C.green, marginBottom: `${T.spacing.sm}px` }}>💰 Payment Schedule</div>
           {sel.payments.map((p, i) => (
             <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: `${T.spacing.sm}px`, borderBottom: i < sel.payments.length - 1 ? `1px solid ${C.border}` : "none" }}>
@@ -842,12 +1193,35 @@ function CalendarView({ isDark, holdings, currency }) {
 // ALERTS VIEW
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function AlertsView({ isDark, holdings, currency }) {
+function AlertsView({ isDark, holdings, currency, location }) {
   const T = isDark ? darkTheme : lightTheme;
   const C = T.colors;
   const [filter, setFilter] = useState("all");
 
-  const alerts = useMemo(() => computeDividendAlerts(holdings), [holdings]);
+  const alerts = useMemo(() => {
+    const allAlerts = computeDividendAlerts(holdings);
+
+    // Add tax warnings for US holdings (FEATURE 6)
+    if (location === "UK") {
+      const usListedETFs = holdings.filter(h => {
+        const etf = DB.find(e => e.t === h.ticker);
+        return etf && etf.ls === "US";
+      });
+      if (usListedETFs.length > 0) {
+        allAlerts.push({
+          type: "withholding",
+          severity: "info",
+          ticker: "US-ETFs",
+          name: "US-Listed Holdings",
+          message: "15% withholding tax on dividends from US-listed ETFs applies",
+          icon: "🌍",
+        });
+      }
+    }
+
+    return allAlerts;
+  }, [holdings, location]);
+
   const filtered = filter === "all" ? alerts : alerts.filter(a => a.severity === filter);
 
   const severityCounts = useMemo(() => {
@@ -865,7 +1239,6 @@ function AlertsView({ isDark, holdings, currency }) {
   }
 
   return <div style={{ padding: `${T.spacing.lg}px`, overflow: "auto", paddingBottom: "100px" }}>
-    {/* Summary Badges */}
     <div style={{ display: "flex", gap: `${T.spacing.sm}px`, marginBottom: `${T.spacing.lg}px`, flexWrap: "wrap" }}>
       <button onClick={() => setFilter("all")} style={{ flex: "1 1 auto", padding: `${T.spacing.sm}px`, background: filter === "all" ? C.accent : C.card, color: filter === "all" ? C.white : C.text, border: `1px solid ${C.border}`, borderRadius: `${T.radii.md}px`, cursor: "pointer", fontWeight: "bold", fontSize: T.fontSize.sm }}>All ({alerts.length})</button>
       <button onClick={() => setFilter("positive")} style={{ flex: "1 1 auto", padding: `${T.spacing.sm}px`, background: filter === "positive" ? C.green : C.card, color: filter === "positive" ? C.white : C.green, border: `1px solid ${C.border}`, borderRadius: `${T.radii.md}px`, cursor: "pointer", fontWeight: "bold", fontSize: T.fontSize.sm }}>📈 Positive ({severityCounts.positive})</button>
@@ -873,7 +1246,6 @@ function AlertsView({ isDark, holdings, currency }) {
       <button onClick={() => setFilter("caution")} style={{ flex: "1 1 auto", padding: `${T.spacing.sm}px`, background: filter === "caution" ? C.red : C.card, color: filter === "caution" ? C.white : C.red, border: `1px solid ${C.border}`, borderRadius: `${T.radii.md}px`, cursor: "pointer", fontWeight: "bold", fontSize: T.fontSize.sm }}>🔴 Caution ({severityCounts.caution})</button>
     </div>
 
-    {/* Alert List */}
     {filtered.length === 0 ? (
       <Card isDark={isDark} style={{ textAlign: "center" }}>
         <div style={{ fontSize: T.fontSize.base, color: C.muted, padding: `${T.spacing.lg}px` }}>No alerts matching this filter</div>
@@ -902,38 +1274,39 @@ function AlertsView({ isDark, holdings, currency }) {
       </Card>
     ))}
 
-    {/* Data Feed Status */}
     <Card isDark={isDark}>
       <div style={{ fontSize: T.fontSize.sm, fontWeight: "bold", color: C.text, marginBottom: `${T.spacing.sm}px` }}>📡 Data Feed Status</div>
       <div style={{ fontSize: T.fontSize.xs, color: C.muted }}>
-        Provider: <strong>{DATA_FEED_CONFIG.provider}</strong> •
-        Status: <strong>{DATA_FEED_CONFIG.enabled ? "Live" : "Static Data"}</strong> •
-        Last sync: <strong>{DATA_FEED_CONFIG.lastSync || "N/A"}</strong>
+        Provider: <strong>{DATA_FEED_CONFIG.provider}</strong> • Status: <strong>{DATA_FEED_CONFIG.enabled ? "Live" : "Static Data"}</strong> • Last sync: <strong>{DATA_FEED_CONFIG.lastSync || "N/A"}</strong>
       </div>
-      <div style={{ fontSize: T.fontSize.xs, color: C.accent, marginTop: `${T.spacing.xs}px` }}>Live data feed integration ready — connect your API to enable real-time alerts</div>
+      <div style={{ fontSize: T.fontSize.xs, color: C.accent, marginTop: `${T.spacing.xs}px` }}>Live data feed integration ready</div>
     </Card>
   </div>;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ANALYTICS VIEW
+// ANALYTICS VIEW (with DRIP & What-If)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function AnalyticsView({ isDark, holdings, currency }) {
+function AnalyticsView({ isDark, holdings, currency, dripEnabled, setDripEnabled }) {
   const T = isDark ? darkTheme : lightTheme;
   const C = T.colors;
+  const [whatIfTicker, setWhatIfTicker] = useState("");
+  const [whatIfAmount, setWhatIfAmount] = useState(10000);
+  const [whatIfType, setWhatIfType] = useState("add-capital");
+  const [whatIfCutPercent, setWhatIfCutPercent] = useState(0);
+  const [whatIfCapitalIncrease, setWhatIfCapitalIncrease] = useState(0);
 
   const enriched = useMemo(() => holdings.map(computeHoldingIncome), [holdings]);
   const totalAnnual = enriched.reduce((a, h) => a + h.annualIncome, 0);
   const totalValue = enriched.reduce((a, h) => a + (h.totalValue || 0), 0);
   const forecast = useMemo(() => forecastIncome(holdings, 10), [holdings]);
+  const forecastDRIP = useMemo(() => forecastIncomeWithDRIP(holdings, 10), [holdings]);
   const catData = useMemo(() => computeIncomeByCategory(holdings), [holdings]);
   const freqData = useMemo(() => computeIncomeByFrequency(holdings), [holdings]);
 
-  // Top yielders
   const topYielders = useMemo(() => [...enriched].sort((a, b) => b.annualIncome - a.annualIncome).slice(0, 5), [enriched]);
 
-  // Income concentration
   const incomeConcentration = useMemo(() => {
     if (enriched.length === 0) return 0;
     const sorted = [...enriched].sort((a, b) => b.annualIncome - a.annualIncome);
@@ -941,7 +1314,6 @@ function AnalyticsView({ isDark, holdings, currency }) {
     return totalAnnual > 0 ? top3Income / totalAnnual : 0;
   }, [enriched, totalAnnual]);
 
-  // Monthly income smoothness
   const monthlyProjection = useMemo(() => computeMonthlyProjection(holdings, 12), [holdings]);
   const incomeStdDev = useMemo(() => {
     if (monthlyProjection.length === 0) return 0;
@@ -949,6 +1321,29 @@ function AnalyticsView({ isDark, holdings, currency }) {
     const variance = monthlyProjection.reduce((a, m) => a + Math.pow(m.total - avg, 2), 0) / monthlyProjection.length;
     return Math.sqrt(variance);
   }, [monthlyProjection]);
+
+  // What-If Computations (FEATURE 4)
+  let whatIfImpact = 0;
+  let whatIfDescription = "";
+
+  if (whatIfType === "add-capital" && whatIfTicker) {
+    const etf = DB.find(e => e.t === whatIfTicker);
+    if (etf) {
+      whatIfImpact = (whatIfAmount * etf.dy) / 12;
+      whatIfDescription = `Adding ${fmtCurrency(whatIfAmount, currency)} to ${whatIfTicker}`;
+    }
+  } else if (whatIfType === "cut-dividend" && whatIfTicker) {
+    const h = enriched.find(x => x.ticker === whatIfTicker);
+    if (h) {
+      whatIfImpact = -(h.monthlyIncome * (whatIfCutPercent / 100));
+      whatIfDescription = `${whatIfTicker} cuts dividend by ${whatIfCutPercent}%`;
+    }
+  } else if (whatIfType === "increase-portfolio") {
+    whatIfImpact = (totalAnnual / 12) * (whatIfCapitalIncrease / 100);
+    whatIfDescription = `Increase total capital by ${whatIfCapitalIncrease}%`;
+  }
+
+  const projectedMonthly = (totalAnnual / 12) + whatIfImpact;
 
   if (holdings.length === 0) {
     return <div style={{ padding: `${T.spacing.xxl}px`, textAlign: "center" }}>
@@ -986,6 +1381,105 @@ function AnalyticsView({ isDark, holdings, currency }) {
           <div style={{ fontSize: T.fontSize.xs, color: C.muted }}>Growth Rate</div>
           <div style={{ fontSize: T.fontSize.lg, fontWeight: "bold", color: C.green }}>{forecast.length > 0 ? fmtPct(forecast[0].growth) : "0%"}</div>
           <div style={{ fontSize: T.fontSize.xs, color: C.muted }}>Weighted avg</div>
+        </div>
+      </div>
+    </Card>
+
+    {/* DRIP Simulator (FEATURE 3) */}
+    <Card isDark={isDark}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: `${T.spacing.md}px` }}>
+        <div style={{ fontSize: T.fontSize.lg, fontWeight: "bold", color: C.text }}>🔄 DRIP Simulator</div>
+        <button onClick={() => setDripEnabled(!dripEnabled)} style={{ width: "50px", height: "28px", borderRadius: "14px", border: "none", background: dripEnabled ? C.green : C.border, cursor: "pointer", position: "relative" }}>
+          <div style={{ position: "absolute", width: "24px", height: "24px", borderRadius: "12px", background: C.white, top: "2px", left: dripEnabled ? "24px" : "2px", transition: `left ${T.transition.fast}` }} />
+        </button>
+      </div>
+      <div style={{ fontSize: T.fontSize.xs, color: C.muted, marginBottom: `${T.spacing.md}px` }}>
+        {dripEnabled ? "Reinvesting dividends (compound growth)" : "Income taken (no reinvestment)"}
+      </div>
+      <div style={{ height: "200px" }}>
+        <ResponsiveContainer width="100%" height="100%">
+          <AreaChart data={dripEnabled ? forecastDRIP : forecast}>
+            <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
+            <XAxis dataKey="year" tick={{ fontSize: 10, fill: C.muted }} />
+            <YAxis tick={{ fontSize: 9, fill: C.muted }} tickFormatter={v => `${currency}${(v / 1000).toFixed(0)}k`} />
+            <Tooltip formatter={(v) => `${currency}${v.toLocaleString()}`} contentStyle={{ background: C.card, border: `1px solid ${C.border}`, fontSize: T.fontSize.sm }} />
+            {dripEnabled ? (
+              <>
+                <Area type="monotone" dataKey="income" stroke={C.amber} fill={C.amberLt} strokeWidth={2} name="Without DRIP" opacity={0.7} />
+                <Area type="monotone" dataKey="dripIncome" stroke={C.green} fill={C.greenLt} strokeWidth={2} name="With DRIP" />
+              </>
+            ) : (
+              <Area type="monotone" dataKey="annual" stroke={C.accent} fill={C.accentLt} strokeWidth={2} />
+            )}
+          </AreaChart>
+        </ResponsiveContainer>
+      </div>
+      {dripEnabled && forecast.length > 0 && forecastDRIP.length > 0 && (
+        <div style={{ marginTop: `${T.spacing.md}px`, padding: `${T.spacing.sm}px`, background: C.greenLt, borderRadius: `${T.radii.sm}px`, color: C.green, fontSize: T.fontSize.sm }}>
+          In 10 years: {fmtCurrency(forecast[10]?.annual || 0, currency)}/yr without DRIP vs {fmtCurrency(forecastDRIP[10]?.dripIncome || 0, currency)}/yr with DRIP
+          <br />
+          <strong>{fmtCurrency((forecastDRIP[10]?.dripIncome || 0) - (forecast[10]?.annual || 0), currency)} more</strong> with dividend reinvestment
+        </div>
+      )}
+    </Card>
+
+    {/* What-If Scenarios (FEATURE 4) */}
+    <Card isDark={isDark}>
+      <div style={{ fontSize: T.fontSize.lg, fontWeight: "bold", color: C.text, marginBottom: `${T.spacing.md}px` }}>🎯 What-If Scenarios</div>
+
+      <Select label="Scenario Type" value={whatIfType} onChange={setWhatIfType} options={[
+        { value: "add-capital", label: "Add capital to holding" },
+        { value: "cut-dividend", label: "Dividend cut" },
+        { value: "increase-portfolio", label: "Increase portfolio capital" },
+      ]} isDark={isDark} icon="⚙️" />
+
+      {(whatIfType === "add-capital" || whatIfType === "cut-dividend") && (
+        <Select label="Holding" value={whatIfTicker} onChange={setWhatIfTicker} options={enriched.map(h => ({ value: h.ticker, label: `${h.ticker} (${fmtCurrency(h.monthlyIncome, currency)}/mo)` }))} isDark={isDark} icon="📊" />
+      )}
+
+      {whatIfType === "add-capital" && (
+        <div>
+          <NumInput label="Add Capital" value={whatIfAmount} onChange={setWhatIfAmount} step={1000} unit={currency} isDark={isDark} icon="💰" />
+          <div style={{ marginBottom: `${T.spacing.md}px`, padding: `${T.spacing.sm}px`, background: C.bg, borderRadius: `${T.radii.sm}px`, fontSize: T.fontSize.sm }}>
+            <div style={{ color: C.muted, marginBottom: `${T.spacing.xs}px` }}>Try slider:</div>
+            <input type="range" min="0" max="50000" step="1000" value={whatIfAmount} onChange={(e) => setWhatIfAmount(Number(e.target.value))} style={{ width: "100%" }} />
+          </div>
+        </div>
+      )}
+
+      {whatIfType === "cut-dividend" && (
+        <div>
+          <NumInput label="Cut Percent" value={whatIfCutPercent} onChange={setWhatIfCutPercent} step={5} unit="%" isDark={isDark} icon="📉" />
+          <div style={{ marginBottom: `${T.spacing.md}px`, padding: `${T.spacing.sm}px`, background: C.bg, borderRadius: `${T.radii.sm}px`, fontSize: T.fontSize.sm }}>
+            <input type="range" min="0" max="100" step="5" value={whatIfCutPercent} onChange={(e) => setWhatIfCutPercent(Number(e.target.value))} style={{ width: "100%" }} />
+          </div>
+        </div>
+      )}
+
+      {whatIfType === "increase-portfolio" && (
+        <div>
+          <NumInput label="Capital Increase" value={whatIfCapitalIncrease} onChange={setWhatIfCapitalIncrease} step={5} unit="%" isDark={isDark} icon="📈" />
+          <div style={{ marginBottom: `${T.spacing.md}px`, padding: `${T.spacing.sm}px`, background: C.bg, borderRadius: `${T.radii.sm}px`, fontSize: T.fontSize.sm }}>
+            <input type="range" min="0" max="100" step="5" value={whatIfCapitalIncrease} onChange={(e) => setWhatIfCapitalIncrease(Number(e.target.value))} style={{ width: "100%" }} />
+          </div>
+        </div>
+      )}
+
+      {/* Impact Display */}
+      <div style={{ padding: `${T.spacing.sm}px`, background: whatIfImpact > 0 ? C.greenLt : whatIfImpact < 0 ? C.redLt : C.bg, borderRadius: `${T.radii.sm}px`, color: whatIfImpact > 0 ? C.green : whatIfImpact < 0 ? C.red : C.muted, fontSize: T.fontSize.sm }}>
+        <div style={{ marginBottom: `${T.spacing.xs}px`, fontWeight: "bold" }}>{whatIfDescription}</div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: `${T.spacing.sm}px`, fontSize: T.fontSize.xs }}>
+          <div>
+            <div style={{ color: C.muted }}>Current monthly</div>
+            <div style={{ fontSize: T.fontSize.base, fontWeight: "bold" }}>{fmtCurrency(totalAnnual / 12, currency)}</div>
+          </div>
+          <div>
+            <div style={{ color: C.muted }}>Projected monthly</div>
+            <div style={{ fontSize: T.fontSize.base, fontWeight: "bold", color: whatIfImpact > 0 ? C.green : whatIfImpact < 0 ? C.red : C.text }}>{fmtCurrency(projectedMonthly, currency)}</div>
+          </div>
+        </div>
+        <div style={{ marginTop: `${T.spacing.sm}px`, paddingTop: `${T.spacing.sm}px`, borderTop: `1px solid ${whatIfImpact > 0 ? C.green : whatIfImpact < 0 ? C.red : C.border}`, fontWeight: "bold", textAlign: "right" }}>
+          {whatIfImpact > 0 ? "+" : ""}{fmtCurrency(whatIfImpact, currency)}/month
         </div>
       </div>
     </Card>
@@ -1050,10 +1544,10 @@ function AnalyticsView({ isDark, holdings, currency }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SETTINGS VIEW
+// SETTINGS VIEW (with Tax Awareness)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function SettingsView({ isDark, setIsDark, location, setLocation, currency }) {
+function SettingsView({ isDark, setIsDark, location, setLocation, currency, incomeTarget, setIncomeTarget, targetYear, setTargetYear, accountType, setAccountType }) {
   const T = isDark ? darkTheme : lightTheme;
   const C = T.colors;
 
@@ -1078,6 +1572,40 @@ function SettingsView({ isDark, setIsDark, location, setLocation, currency }) {
         <div style={{ display: "flex", gap: `${T.spacing.sm}px` }}>
           <button onClick={() => setLocation("UK")} style={{ flex: 1, padding: `${T.spacing.md}px`, background: location === "UK" ? C.accent : C.card, color: location === "UK" ? C.white : C.text, border: `1px solid ${C.border}`, borderRadius: `${T.radii.md}px`, cursor: "pointer", fontWeight: "bold" }}>🇬🇧 UK</button>
           <button onClick={() => setLocation("US")} style={{ flex: 1, padding: `${T.spacing.md}px`, background: location === "US" ? C.accent : C.card, color: location === "US" ? C.white : C.text, border: `1px solid ${C.border}`, borderRadius: `${T.radii.md}px`, cursor: "pointer", fontWeight: "bold" }}>🇺🇸 USA</button>
+        </div>
+      </div>
+
+      {/* Income Goals */}
+      <div style={{ marginBottom: `${T.spacing.lg}px`, padding: `${T.spacing.md}px`, background: C.bg, borderRadius: `${T.radii.sm}px` }}>
+        <div style={{ fontSize: T.fontSize.base, fontWeight: "bold", color: C.text, marginBottom: `${T.spacing.md}px` }}>🎯 Income Goals</div>
+        <NumInput label={`Monthly Target (${location === "UK" ? "£" : "$"})`} value={incomeTarget} onChange={setIncomeTarget} step={100} isDark={isDark} icon="💰" />
+        <NumInput label="Target Year" value={targetYear} onChange={setTargetYear} step={1} isDark={isDark} icon="📅" />
+      </div>
+
+      {/* Tax Awareness (FEATURE 6) */}
+      <div style={{ marginBottom: `${T.spacing.lg}px`, padding: `${T.spacing.md}px`, background: C.bg, borderRadius: `${T.radii.sm}px` }}>
+        <div style={{ fontSize: T.fontSize.base, fontWeight: "bold", color: C.text, marginBottom: `${T.spacing.md}px` }}>🏦 Account Type & Tax</div>
+        <Select label="Account Type" value={accountType} onChange={setAccountType} options={
+          location === "UK" ?
+            [
+              { value: "SIPP", label: "SIPP (Self-Invested Personal Pension)" },
+              { value: "ISA", label: "ISA (Individual Savings Account)" },
+              { value: "GIA", label: "GIA (General Investment Account)" }
+            ] :
+            [
+              { value: "IRA", label: "IRA (Individual Retirement Account)" },
+              { value: "401k", label: "401(k) (Employer Retirement Plan)" },
+              { value: "Taxable", label: "Taxable Brokerage Account" }
+            ]
+        } isDark={isDark} icon="🏦" />
+
+        <div style={{ padding: `${T.spacing.sm}px`, background: isDark ? "rgba(100,200,100,0.1)" : C.greenLt, borderRadius: `${T.radii.sm}px`, marginTop: `${T.spacing.md}px`, fontSize: T.fontSize.xs, color: location === "UK" && accountType === "GIA" || location === "US" && accountType === "Taxable" ? C.amber : C.green }}>
+          {location === "UK" && accountType === "SIPP" && "✓ All dividends are tax-free. Growth is completely tax-deferred."}
+          {location === "UK" && accountType === "ISA" && "✓ All dividends are tax-free. No capital gains tax."}
+          {location === "UK" && accountType === "GIA" && "⚠️ First £1,000 of dividends are tax-free. Excess taxed at 33.75% (higher rate)."}
+          {location === "US" && accountType === "IRA" && "✓ Dividends are tax-deferred. Taxed on withdrawal."}
+          {location === "US" && accountType === "401k" && "✓ Dividends are tax-deferred. Taxed on withdrawal."}
+          {location === "US" && accountType === "Taxable" && "⚠️ Dividends taxed annually at 15% (qualified) or 37% (non-qualified)."}
         </div>
       </div>
     </Card>
@@ -1106,7 +1634,7 @@ function SettingsView({ isDark, setIsDark, location, setLocation, currency }) {
           <div style={{ color: C.text, fontWeight: "bold" }}>{DATA_FEED_CONFIG.apiEndpoint || "Not configured"}</div>
         </div>
         <div style={{ fontSize: T.fontSize.xs, color: C.accent, marginTop: `${T.spacing.md}px`, padding: `${T.spacing.sm}px`, background: C.accentLt, borderRadius: `${T.radii.sm}px` }}>
-          Ready for live data feed integration. Configure your API endpoint to enable real-time dividend data, ex-date tracking, and automatic cut/raise alerts.
+          Ready for live data feed integration. Configure your API endpoint to enable real-time dividend data.
         </div>
       </div>
     </Card>
@@ -1114,9 +1642,9 @@ function SettingsView({ isDark, setIsDark, location, setLocation, currency }) {
     {/* About */}
     <Card isDark={isDark}>
       <div style={{ textAlign: "center", color: C.muted, fontSize: T.fontSize.sm }}>
-        <div style={{ fontWeight: "bold", marginBottom: `${T.spacing.xs}px` }}>Dividend Income Tracker v1.0</div>
+        <div style={{ fontWeight: "bold", marginBottom: `${T.spacing.xs}px` }}>Dividend Income Tracker v2.0</div>
         <div>Part of the SIPP Portfolio Suite</div>
-        <div style={{ marginTop: `${T.spacing.xs}px`, fontSize: T.fontSize.xs }}>Data feed architecture ready for live API integration</div>
+        <div style={{ marginTop: `${T.spacing.xs}px`, fontSize: T.fontSize.xs }}>Enhanced with onboarding, DRIP simulator, what-if scenarios, tax awareness, and more</div>
       </div>
     </Card>
   </div>;
@@ -1128,9 +1656,15 @@ function SettingsView({ isDark, setIsDark, location, setLocation, currency }) {
 
 export default function App() {
   const [isDark, setIsDark] = useState(false);
+  const [onboarded, setOnboarded] = useState(false);
   const [tab, setTab] = useState("dashboard");
   const [location, setLocation] = useState("UK");
+  const [incomeTarget, setIncomeTarget] = useState(2000);
+  const [targetYear, setTargetYear] = useState(2030);
+  const [accountType, setAccountType] = useState("SIPP");
   const [holdings, setHoldings] = useState([]);
+  const [dripEnabled, setDripEnabled] = useState(false);
+  const [dividendLog, setDividendLog] = useState([]);
 
   const currency = location === "UK" ? "£" : "$";
   const T = isDark ? darkTheme : lightTheme;
@@ -1138,6 +1672,18 @@ export default function App() {
 
   const alerts = useMemo(() => computeDividendAlerts(holdings), [holdings]);
   const alertCount = alerts.filter(a => a.severity === "warning" || a.severity === "caution").length;
+
+  const handleOnboardingComplete = (data) => {
+    setLocation(data.location);
+    setIncomeTarget(data.incomeTarget);
+    setTargetYear(data.targetYear);
+    setAccountType(data.accountType);
+    setOnboarded(true);
+  };
+
+  if (!onboarded) {
+    return <OnboardingWizard isDark={isDark} onComplete={handleOnboardingComplete} />;
+  }
 
   return (
     <ErrorBoundary>
@@ -1157,12 +1703,12 @@ export default function App() {
 
         {/* Content */}
         <div style={{ flex: 1, overflow: "auto" }}>
-          {tab === "dashboard" && <DashboardView isDark={isDark} holdings={holdings} currency={currency} />}
-          {tab === "holdings" && <HoldingsView isDark={isDark} holdings={holdings} setHoldings={setHoldings} currency={currency} location={location} />}
+          {tab === "dashboard" && <DashboardView isDark={isDark} holdings={holdings} currency={currency} incomeTarget={incomeTarget} targetYear={targetYear} accountType={accountType} location={location} dividendLog={dividendLog} dripEnabled={dripEnabled} />}
+          {tab === "holdings" && <HoldingsView isDark={isDark} holdings={holdings} setHoldings={setHoldings} currency={currency} location={location} dividendLog={dividendLog} setDividendLog={setDividendLog} />}
           {tab === "calendar" && <CalendarView isDark={isDark} holdings={holdings} currency={currency} />}
-          {tab === "alerts" && <AlertsView isDark={isDark} holdings={holdings} currency={currency} />}
-          {tab === "analytics" && <AnalyticsView isDark={isDark} holdings={holdings} currency={currency} />}
-          {tab === "settings" && <SettingsView isDark={isDark} setIsDark={setIsDark} location={location} setLocation={setLocation} currency={currency} />}
+          {tab === "alerts" && <AlertsView isDark={isDark} holdings={holdings} currency={currency} location={location} />}
+          {tab === "analytics" && <AnalyticsView isDark={isDark} holdings={holdings} currency={currency} dripEnabled={dripEnabled} setDripEnabled={setDripEnabled} />}
+          {tab === "settings" && <SettingsView isDark={isDark} setIsDark={setIsDark} location={location} setLocation={setLocation} currency={currency} incomeTarget={incomeTarget} setIncomeTarget={setIncomeTarget} targetYear={targetYear} setTargetYear={setTargetYear} accountType={accountType} setAccountType={setAccountType} />}
         </div>
 
         {/* Navigation */}
