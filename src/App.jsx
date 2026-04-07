@@ -220,8 +220,7 @@ function generateExDay(ticker) {
 
 function fmtCurrency(amount, currency = "£") {
   if (Math.abs(amount) >= 1000000) return `${currency}${(amount / 1000000).toFixed(2)}m`;
-  if (Math.abs(amount) >= 1000) return `${currency}${amount.toLocaleString("en-GB", { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`;
-  return `${currency}${amount.toFixed(2)}`;
+  return `${currency}${amount.toLocaleString("en-GB", { minimumFractionDigits: amount % 1 === 0 ? 0 : 2, maximumFractionDigits: 2 })}`;
 }
 
 function fmtPct(value) {
@@ -550,15 +549,27 @@ const Select = ({ label, value, onChange, options, icon = "", isDark }) => {
   </div>;
 };
 
-const NumInput = ({ label, value, onChange, step = 1, unit = "", icon = "", isDark }) => {
+const NumInput = ({ label, value, onChange, step = 1, unit = "", icon = "", isDark, helper = "" }) => {
   const T = isDark ? darkTheme : lightTheme;
   const C = T.colors;
+  const [raw, setRaw] = useState(String(value));
+  const inputRef = useRef(null);
+  useEffect(() => { if (document.activeElement !== inputRef.current) setRaw(String(value)); }, [value]);
+  const handleChange = (e) => {
+    const v = e.target.value;
+    setRaw(v);
+    if (v === "" || v === "-") return;
+    const n = Number(v);
+    if (!isNaN(n)) onChange(n);
+  };
+  const handleBlur = () => { if (raw === "" || raw === "-") { setRaw(String(value)); } };
   return <div style={{ marginBottom: `${T.spacing.md}px`, flex: "1 1 auto" }}>
     <label style={{ display: "block", fontSize: T.fontSize.base, color: C.text, marginBottom: `${T.spacing.xs}px`, fontWeight: "500" }}>{icon} {label}</label>
     <div style={{ display: "flex", gap: `${T.spacing.xs}px`, alignItems: "center" }}>
-      <input type="number" value={value} onChange={(e) => onChange(Number(e.target.value))} step={step} style={{ flex: "1", padding: `${T.spacing.sm}px`, border: `1px solid ${C.border}`, borderRadius: `${T.radii.sm}px`, fontSize: T.fontSize.base, fontFamily: T.font.family, color: C.text, background: C.card, boxSizing: "border-box" }} />
+      <input ref={inputRef} type="number" value={raw} onChange={handleChange} onBlur={handleBlur} onFocus={(e) => e.target.select()} step={step} style={{ flex: "1", padding: `${T.spacing.sm}px`, border: `1px solid ${C.border}`, borderRadius: `${T.radii.sm}px`, fontSize: T.fontSize.base, fontFamily: T.font.family, color: C.text, background: C.card, boxSizing: "border-box" }} />
       {unit && <span style={{ fontSize: T.fontSize.base, color: C.muted, minWidth: "30px" }}>{unit}</span>}
     </div>
+    {helper && <div style={{ fontSize: T.fontSize.xs, color: C.muted, marginTop: "2px" }}>{helper}</div>}
   </div>;
 };
 
@@ -624,7 +635,14 @@ function OnboardingWizard({ isDark, onComplete }) {
       {/* Step 2: Target Year */}
       {step === 2 && <div style={{ width: "100%", maxWidth: "300px" }}>
         <div style={{ fontSize: T.fontSize.lg, fontWeight: "bold", color: C.text, marginBottom: `${T.spacing.md}px`, textAlign: "center" }}>Target year?</div>
-        <NumInput label="Year" value={targetYear} onChange={setTargetYear} step={1} isDark={isDark} icon="📅" />
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: `${T.spacing.md}px`, marginBottom: `${T.spacing.md}px` }}>
+          <button onClick={() => setTargetYear(Math.max(new Date().getFullYear(), targetYear - 1))} style={{ width: "48px", height: "48px", borderRadius: "50%", border: `2px solid ${C.border}`, background: C.card, color: C.text, fontSize: "24px", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: "bold" }}>−</button>
+          <div style={{ textAlign: "center" }}>
+            <div style={{ fontSize: "36px", fontWeight: "bold", color: C.accent }}>{targetYear}</div>
+            <div style={{ fontSize: T.fontSize.xs, color: C.muted }}>{targetYear - new Date().getFullYear()} years from now</div>
+          </div>
+          <button onClick={() => setTargetYear(targetYear + 1)} style={{ width: "48px", height: "48px", borderRadius: "50%", border: `2px solid ${C.border}`, background: C.card, color: C.text, fontSize: "24px", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: "bold" }}>+</button>
+        </div>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: `${T.spacing.sm}px`, marginTop: `${T.spacing.md}px` }}>
           {yearPresets.map((p, i) => (
             <button key={i} onClick={() => setTargetYear(p)} style={{ padding: `${T.spacing.sm}px`, background: targetYear === p ? C.accent : C.card, color: targetYear === p ? C.white : C.text, border: `1px solid ${C.border}`, borderRadius: `${T.radii.sm}px`, cursor: "pointer", fontSize: T.fontSize.sm }}>
@@ -996,7 +1014,7 @@ function HoldingsView({ isDark, holdings, setHoldings, currency, location, divid
       <Select label="ETF / Stock" value={selectedTicker} onChange={setSelectedTicker} options={filteredDB.map(e => ({ value: e.t, label: `${e.t} — ${e.n.substring(0, 35)} (${fmtPct(e.dy)} yield)` }))} isDark={isDark} icon="📈" />
       <div style={{ display: "flex", gap: `${T.spacing.md}px` }}>
         <NumInput label="Shares" value={addShares} onChange={setAddShares} step={1} isDark={isDark} icon="🔢" />
-        <NumInput label="Cost Basis" value={addCostBasis} onChange={setAddCostBasis} step={100} unit={currency} isDark={isDark} icon="💰" />
+        <NumInput label="Amount Invested" value={addCostBasis} onChange={setAddCostBasis} step={100} unit={currency} isDark={isDark} icon="💰" helper="Total amount you paid for these shares" />
       </div>
       {selectedTicker && (() => {
         const etf = DB.find(e => e.t === selectedTicker);
@@ -1017,8 +1035,10 @@ function HoldingsView({ isDark, holdings, setHoldings, currency, location, divid
 
     {enriched.length === 0 ? (
       <Card isDark={isDark} style={{ textAlign: "center" }}>
-        <div style={{ fontSize: "32px", marginBottom: `${T.spacing.md}px` }}>📋</div>
-        <div style={{ fontSize: T.fontSize.base, color: C.muted }}>No holdings yet. Add your first ETF or import from the Portfolio Optimiser.</div>
+        <div style={{ fontSize: "48px", marginBottom: `${T.spacing.md}px` }}>📋</div>
+        <div style={{ fontSize: T.fontSize.lg, fontWeight: "bold", color: C.text, marginBottom: `${T.spacing.sm}px` }}>No holdings yet</div>
+        <div style={{ fontSize: T.fontSize.sm, color: C.muted, marginBottom: `${T.spacing.lg}px` }}>Tap <strong>"+ Add Holding"</strong> above to search for an ETF and add it to your portfolio, or use <strong>"📥 Import"</strong> to bring in your portfolio from the ETF Optimiser.</div>
+        <button onClick={() => { setShowAdd(true); setShowImport(false); }} style={{ padding: `${T.spacing.md}px ${T.spacing.xl}px`, background: C.accent, color: C.white, border: "none", borderRadius: `${T.radii.md}px`, cursor: "pointer", fontWeight: "bold", fontSize: T.fontSize.base }}>+ Add Your First Holding</button>
       </Card>
     ) : (
       <Card isDark={isDark} style={{ padding: 0, overflow: "hidden" }}>
@@ -1037,7 +1057,7 @@ function HoldingsView({ isDark, holdings, setHoldings, currency, location, divid
             {editIdx === i && <div style={{ marginTop: `${T.spacing.md}px`, padding: `${T.spacing.sm}px`, background: C.bg, borderRadius: `${T.radii.sm}px` }}>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: `${T.spacing.sm}px`, fontSize: T.fontSize.sm, color: C.text, marginBottom: `${T.spacing.md}px` }}>
                 <div>Shares: <strong>{h.shares}</strong></div>
-                <div>Cost: <strong>{fmtCurrency(h.costBasis, currency)}</strong></div>
+                <div>Invested: <strong>{fmtCurrency(h.costBasis, currency)}</strong></div>
                 <div>Value: <strong>{fmtCurrency(h.totalValue, currency)}</strong></div>
                 <div>Annual: <strong>{fmtCurrency(h.annualIncome, currency)}</strong></div>
                 <div>Yield on Cost: <strong>{fmtPct(h.yieldOnCost)}</strong></div>
@@ -1713,12 +1733,12 @@ export default function App() {
 
         {/* Navigation */}
         <div style={{ display: "flex", borderTop: `1px solid ${C.border}`, flexShrink: 0, background: C.bg }}>
+          <NavBtn label="Settings" icon="⚙️" active={tab === "settings"} onClick={() => setTab("settings")} isDark={isDark} />
           <NavBtn label="Dashboard" icon="📊" active={tab === "dashboard"} onClick={() => setTab("dashboard")} isDark={isDark} />
           <NavBtn label="Holdings" icon="💼" active={tab === "holdings"} onClick={() => setTab("holdings")} isDark={isDark} />
           <NavBtn label="Calendar" icon="📅" active={tab === "calendar"} onClick={() => setTab("calendar")} isDark={isDark} />
           <NavBtn label="Alerts" icon="🔔" active={tab === "alerts"} onClick={() => setTab("alerts")} isDark={isDark} badge={alertCount} />
           <NavBtn label="Analytics" icon="📈" active={tab === "analytics"} onClick={() => setTab("analytics")} isDark={isDark} />
-          <NavBtn label="Settings" icon="⚙️" active={tab === "settings"} onClick={() => setTab("settings")} isDark={isDark} />
         </div>
       </div>
     </ErrorBoundary>
