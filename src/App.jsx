@@ -235,6 +235,100 @@ function getDaysUntil(exDate) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// CSV IMPORT — Platform-aware parsers (matches Portfolio Rebalancer)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function parseNum(s) {
+  if (s == null) return 0;
+  const cleaned = String(s).replace(/[£$€,\s]/g, "");
+  const v = parseFloat(cleaned);
+  return isNaN(v) ? 0 : v;
+}
+
+function extractTicker(name) {
+  if (!name) return "";
+  const match = name.match(/\(([A-Z0-9]{2,6})\)/);
+  if (match) return match[1];
+  const db = DB.find(e => name.toLowerCase().includes(e.n.toLowerCase().slice(0, 20)));
+  return db ? db.t : "";
+}
+
+function splitCSVLine(line) {
+  const result = [];
+  let current = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') { inQuotes = !inQuotes; }
+    else if (ch === "," && !inQuotes) { result.push(current); current = ""; }
+    else { current += ch; }
+  }
+  result.push(current);
+  return result;
+}
+
+const CSV_PARSERS = {
+  "Hargreaves Lansdown": {
+    detect: (h) => h.some(x => /stock/i.test(x)) && h.some(x => /value.*£|val/i.test(x)),
+    parse: (rows, h) => { const iN=h.findIndex(x=>/stock|holding|fund/i.test(x)),iT=h.findIndex(x=>/ticker|epic|symbol|code/i.test(x)),iS=h.findIndex(x=>/units|quantity|shares/i.test(x)&&!/stock/i.test(x)),iV=h.findIndex(x=>/value|val/i.test(x)); return rows.map(r=>({name:r[iN]||"",ticker:(r[iT]||extractTicker(r[iN])||"").toUpperCase(),shares:parseNum(r[iS]),value:parseNum(r[iV])})).filter(x=>x.shares>0||x.value>0); }
+  },
+  "AJ Bell": {
+    detect: (h) => h.some(x => /investment/i.test(x)) && h.some(x => /quantity/i.test(x)),
+    parse: (rows, h) => { const iN=h.findIndex(x=>/investment|fund|name/i.test(x)),iT=h.findIndex(x=>/sedol|ticker|code|epic/i.test(x)),iS=h.findIndex(x=>/quantity|units|shares/i.test(x)),iV=h.findIndex(x=>/value|market/i.test(x)); return rows.map(r=>({name:r[iN]||"",ticker:(r[iT]||extractTicker(r[iN])||"").toUpperCase(),shares:parseNum(r[iS]),value:parseNum(r[iV])})).filter(x=>x.shares>0||x.value>0); }
+  },
+  "Interactive Investor": {
+    detect: (h) => h.some(x => /holding/i.test(x)) && h.some(x => /sedol|epic/i.test(x)),
+    parse: (rows, h) => { const iN=h.findIndex(x=>/holding|name|investment/i.test(x)),iT=h.findIndex(x=>/sedol|epic|ticker|code/i.test(x)),iS=h.findIndex(x=>/quantity|units|shares/i.test(x)),iV=h.findIndex(x=>/value|val/i.test(x)); return rows.map(r=>({name:r[iN]||"",ticker:(r[iT]||extractTicker(r[iN])||"").toUpperCase(),shares:parseNum(r[iS]),value:parseNum(r[iV])})).filter(x=>x.shares>0||x.value>0); }
+  },
+  "Vanguard": {
+    detect: (h) => h.some(x => /fund.*name/i.test(x)) && h.some(x => /book.*cost|total.*cost/i.test(x)),
+    parse: (rows, h) => { const iN=h.findIndex(x=>/fund.*name|name/i.test(x)),iT=h.findIndex(x=>/ticker|symbol|code/i.test(x)),iS=h.findIndex(x=>/units|shares|quantity/i.test(x)),iV=h.findIndex(x=>/value|market/i.test(x)); return rows.map(r=>({name:r[iN]||"",ticker:(r[iT]||extractTicker(r[iN])||"").toUpperCase(),shares:parseNum(r[iS]),value:parseNum(r[iV])})).filter(x=>x.shares>0||x.value>0); }
+  },
+  "Fidelity": {
+    detect: (h) => h.some(x => /fund/i.test(x)) && h.some(x => /total.*units|units.*held/i.test(x)),
+    parse: (rows, h) => { const iN=h.findIndex(x=>/fund|investment|name/i.test(x)),iT=h.findIndex(x=>/ticker|code|symbol|isin/i.test(x)),iS=h.findIndex(x=>/units|shares|quantity/i.test(x)),iV=h.findIndex(x=>/value|market/i.test(x)); return rows.map(r=>({name:r[iN]||"",ticker:(r[iT]||extractTicker(r[iN])||"").toUpperCase(),shares:parseNum(r[iS]),value:parseNum(r[iV])})).filter(x=>x.shares>0||x.value>0); }
+  },
+  "Trading 212": {
+    detect: (h) => h.some(x => /action|type/i.test(x)) && h.some(x => /ticker/i.test(x)),
+    parse: (rows, h) => { const iN=h.findIndex(x=>/name|instrument/i.test(x)),iT=h.findIndex(x=>/ticker|symbol/i.test(x)),iS=h.findIndex(x=>/shares|quantity|number/i.test(x)),iV=h.findIndex(x=>/value|total|result/i.test(x)); return rows.map(r=>({name:r[iN]||"",ticker:(r[iT]||"").toUpperCase(),shares:parseNum(r[iS]),value:parseNum(r[iV])})).filter(x=>x.shares>0||x.value>0); }
+  },
+  "Generic": {
+    detect: () => true,
+    parse: (rows, h) => { const iN=h.findIndex(x=>/name|fund|holding|investment|stock/i.test(x)),iT=h.findIndex(x=>/ticker|symbol|code|epic|sedol/i.test(x)),iS=h.findIndex(x=>/shares|units|quantity|qty/i.test(x)),iV=h.findIndex(x=>/value|val|market|worth/i.test(x)); return rows.map(r=>({name:r[iN>=0?iN:0]||"",ticker:(r[iT>=0?iT:(iN>=0?iN:0)]||"").toUpperCase(),shares:parseNum(r[iS>=0?iS:1]),value:parseNum(r[iV>=0?iV:2])})).filter(x=>x.shares>0||x.value>0); }
+  }
+};
+
+function parseCSV(text) {
+  const lines = text.split(/\r?\n/).filter(l => l.trim());
+  if (lines.length < 2) return { holdings: [], platform: "Unknown" };
+  let headerIdx = 0;
+  for (let i = 0; i < Math.min(lines.length, 10); i++) {
+    const cols = splitCSVLine(lines[i]);
+    if (cols.length >= 2 && cols.some(c => /name|ticker|fund|stock|holding|investment|symbol|units|shares|quantity|value/i.test(c))) {
+      headerIdx = i;
+      break;
+    }
+  }
+  const headers = splitCSVLine(lines[headerIdx]).map(h => h.trim().replace(/^["']|["']$/g, ""));
+  const rows = lines.slice(headerIdx + 1).map(l => splitCSVLine(l).map(c => c.trim().replace(/^["']|["']$/g, "")));
+  let platform = "Generic";
+  let holdings = [];
+  for (const [name, parser] of Object.entries(CSV_PARSERS)) {
+    if (name === "Generic") continue;
+    if (parser.detect(headers)) { holdings = parser.parse(rows, headers); platform = name; break; }
+  }
+  if (!holdings.length) holdings = CSV_PARSERS.Generic.parse(rows, headers);
+  // Enrich: match tickers to DB for dividend data, compute costBasis from value
+  holdings = holdings.map(h => {
+    const db = DB.find(e => e.t === h.ticker);
+    if (db && !h.name) h.name = db.n;
+    const costBasis = h.value > 0 ? h.value : (h.shares * 100);
+    return { ticker: h.ticker, shares: h.shares, costBasis, dateAdded: new Date().toISOString().slice(0, 10), matched: !!db };
+  }).filter(h => DB.some(e => e.t === h.ticker));
+  return { holdings, platform, total: holdings.length };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // CORE COMPUTATION
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -622,11 +716,18 @@ function OnboardingWizard({ isDark, onComplete }) {
       {/* Step 1: Income Target */}
       {step === 1 && <div style={{ width: "100%", maxWidth: "300px" }}>
         <div style={{ fontSize: T.fontSize.lg, fontWeight: "bold", color: C.text, marginBottom: `${T.spacing.md}px`, textAlign: "center" }}>Monthly income target?</div>
-        <NumInput label={`Target (${location === "UK" ? "£" : "$"})`} value={incomeTarget} onChange={setIncomeTarget} step={100} isDark={isDark} icon="💰" />
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: `${T.spacing.md}px`, marginBottom: `${T.spacing.md}px` }}>
+          <button onClick={() => setIncomeTarget(Math.max(0, incomeTarget - 100))} style={{ width: "48px", height: "48px", borderRadius: "50%", border: `2px solid ${C.border}`, background: C.card, color: C.text, fontSize: "24px", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: "bold" }}>−</button>
+          <div style={{ textAlign: "center" }}>
+            <div style={{ fontSize: "36px", fontWeight: "bold", color: C.accent }}>{location === "UK" ? "£" : "$"}{incomeTarget.toLocaleString("en-GB")}</div>
+            <div style={{ fontSize: T.fontSize.xs, color: C.muted }}>per month</div>
+          </div>
+          <button onClick={() => setIncomeTarget(incomeTarget + 100)} style={{ width: "48px", height: "48px", borderRadius: "50%", border: `2px solid ${C.border}`, background: C.card, color: C.text, fontSize: "24px", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: "bold" }}>+</button>
+        </div>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: `${T.spacing.sm}px`, marginTop: `${T.spacing.md}px` }}>
           {incomePresets.map((p, i) => (
             <button key={i} onClick={() => setIncomeTarget(p)} style={{ padding: `${T.spacing.sm}px`, background: incomeTarget === p ? C.accent : C.card, color: incomeTarget === p ? C.white : C.text, border: `1px solid ${C.border}`, borderRadius: `${T.radii.sm}px`, cursor: "pointer", fontSize: T.fontSize.sm }}>
-              {location === "UK" ? "£" : "$"}{p}
+              {location === "UK" ? "£" : "$"}{p.toLocaleString("en-GB")}
             </button>
           ))}
         </div>
@@ -937,6 +1038,35 @@ function HoldingsView({ isDark, holdings, setHoldings, currency, location, divid
   const [logIdx, setLogIdx] = useState(-1);
   const [logDate, setLogDate] = useState(new Date().toISOString().slice(0, 10));
   const [logAmount, setLogAmount] = useState(0);
+  const [showCSV, setShowCSV] = useState(false);
+  const [csvMsg, setCsvMsg] = useState("");
+  const [csvPlatform, setCsvPlatform] = useState("");
+  const csvRef = useRef(null);
+
+  const handleCSV = useCallback((e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const { holdings: parsed, platform, total } = parseCSV(ev.target.result);
+        if (parsed.length === 0) {
+          setCsvMsg("No matching holdings found. Ensure your CSV contains tickers that match the ETF database.");
+          setCsvPlatform("");
+          return;
+        }
+        setHoldings(parsed);
+        setCsvPlatform(platform);
+        setCsvMsg(`Imported ${parsed.length} holding${parsed.length !== 1 ? "s" : ""} from ${platform} format. Dividend data auto-matched.`);
+        setShowCSV(false);
+      } catch (err) {
+        setCsvMsg(`Error parsing file: ${err.message}`);
+        setCsvPlatform("");
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  }, [setHoldings]);
 
   const enriched = useMemo(() => holdings.map(computeHoldingIncome), [holdings]);
   const totalValue = enriched.reduce((a, h) => a + (h.totalValue || 0), 0);
@@ -996,10 +1126,25 @@ function HoldingsView({ isDark, holdings, setHoldings, currency, location, divid
 
   return <div style={{ padding: `${T.spacing.lg}px`, overflow: "auto", paddingBottom: "100px" }}>
     <div style={{ display: "flex", gap: `${T.spacing.sm}px`, marginBottom: `${T.spacing.lg}px`, flexWrap: "wrap" }}>
-      <button onClick={() => { setShowAdd(!showAdd); setShowImport(false); }} style={{ flex: "1 1 auto", padding: `${T.spacing.md}px`, background: C.accent, color: C.white, border: "none", borderRadius: `${T.radii.md}px`, cursor: "pointer", fontWeight: "bold", fontSize: T.fontSize.base }}>+ Add Holding</button>
-      <button onClick={() => { setShowImport(!showImport); setShowAdd(false); }} style={{ flex: "1 1 auto", padding: `${T.spacing.md}px`, background: C.purple, color: C.white, border: "none", borderRadius: `${T.radii.md}px`, cursor: "pointer", fontWeight: "bold", fontSize: T.fontSize.base }}>📥 Import</button>
+      <button onClick={() => { setShowAdd(!showAdd); setShowImport(false); setShowCSV(false); }} style={{ flex: "1 1 auto", padding: `${T.spacing.md}px`, background: C.accent, color: C.white, border: "none", borderRadius: `${T.radii.md}px`, cursor: "pointer", fontWeight: "bold", fontSize: T.fontSize.base }}>+ Add Holding</button>
+      <button onClick={() => { setShowCSV(!showCSV); setShowAdd(false); setShowImport(false); }} style={{ flex: "1 1 auto", padding: `${T.spacing.md}px`, background: C.amber, color: C.white, border: "none", borderRadius: `${T.radii.md}px`, cursor: "pointer", fontWeight: "bold", fontSize: T.fontSize.base }}>📄 Import CSV</button>
+      <button onClick={() => { setShowImport(!showImport); setShowAdd(false); setShowCSV(false); }} style={{ flex: "1 1 auto", padding: `${T.spacing.md}px`, background: C.purple, color: C.white, border: "none", borderRadius: `${T.radii.md}px`, cursor: "pointer", fontWeight: "bold", fontSize: T.fontSize.base }}>📥 Import JSON</button>
       {holdings.length > 0 && <button onClick={handleExport} style={{ flex: "1 1 auto", padding: `${T.spacing.md}px`, background: C.green, color: C.white, border: "none", borderRadius: `${T.radii.md}px`, cursor: "pointer", fontWeight: "bold", fontSize: T.fontSize.base }}>📤 Export</button>}
     </div>
+
+    {csvMsg && <div style={{ padding: `${T.spacing.sm}px ${T.spacing.md}px`, background: csvPlatform ? C.greenLt : C.redLt, borderRadius: `${T.radii.sm}px`, fontSize: T.fontSize.sm, color: csvPlatform ? C.green : C.red, marginBottom: `${T.spacing.md}px` }}>
+      {csvPlatform && <strong>Detected: {csvPlatform} — </strong>}{csvMsg}
+    </div>}
+
+    {showCSV && <Card isDark={isDark}>
+      <div style={{ fontSize: T.fontSize.lg, fontWeight: "bold", color: C.text, marginBottom: `${T.spacing.md}px` }}>📄 Import from CSV</div>
+      <div style={{ fontSize: T.fontSize.sm, color: C.muted, marginBottom: `${T.spacing.md}px` }}>Upload a CSV export from your broker. Tickers are auto-matched to the ETF database for dividend yield data.</div>
+      <button onClick={() => csvRef.current?.click()} style={{ width: "100%", padding: `${T.spacing.md}px`, background: C.amber, color: C.white, border: "none", borderRadius: `${T.radii.md}px`, cursor: "pointer", fontWeight: "bold", marginBottom: `${T.spacing.md}px`, fontSize: T.fontSize.base }}>Choose CSV File</button>
+      <input ref={csvRef} type="file" accept=".csv,.tsv,.txt" onChange={handleCSV} style={{ display: "none" }} />
+      <div style={{ fontSize: T.fontSize.xs, color: C.muted, padding: `${T.spacing.sm}px`, background: C.bg, borderRadius: `${T.radii.sm}px` }}>
+        Supports: Hargreaves Lansdown, AJ Bell, Interactive Investor, Vanguard, Fidelity, Trading 212, and generic CSV formats.
+      </div>
+    </Card>}
 
     {showImport && <Card isDark={isDark}>
       <div style={{ fontSize: T.fontSize.lg, fontWeight: "bold", color: C.text, marginBottom: `${T.spacing.md}px` }}>📥 Import from ETF Optimiser</div>
@@ -1734,8 +1879,8 @@ export default function App() {
         {/* Navigation */}
         <div style={{ display: "flex", borderTop: `1px solid ${C.border}`, flexShrink: 0, background: C.bg }}>
           <NavBtn label="Settings" icon="⚙️" active={tab === "settings"} onClick={() => setTab("settings")} isDark={isDark} />
-          <NavBtn label="Dashboard" icon="📊" active={tab === "dashboard"} onClick={() => setTab("dashboard")} isDark={isDark} />
           <NavBtn label="Holdings" icon="💼" active={tab === "holdings"} onClick={() => setTab("holdings")} isDark={isDark} />
+          <NavBtn label="Dashboard" icon="📊" active={tab === "dashboard"} onClick={() => setTab("dashboard")} isDark={isDark} />
           <NavBtn label="Calendar" icon="📅" active={tab === "calendar"} onClick={() => setTab("calendar")} isDark={isDark} />
           <NavBtn label="Alerts" icon="🔔" active={tab === "alerts"} onClick={() => setTab("alerts")} isDark={isDark} badge={alertCount} />
           <NavBtn label="Analytics" icon="📈" active={tab === "analytics"} onClick={() => setTab("analytics")} isDark={isDark} />
